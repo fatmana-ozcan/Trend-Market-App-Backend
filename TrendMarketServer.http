@@ -1,0 +1,6 @@
+@TrendMarketServer_HostAddress = http://localhost:5034
+
+GET {{TrendMarketServer_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###

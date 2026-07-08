@@ -1,0 +1,25 @@
+# Build artifacts
+bin/
+obj/
+*.user
+
+# SQLite runtime database
+*.db
+*.db-shm
+*.db-wal
+*.db.bak
+
+# Kullanıcı tarafından yüklenen içerik (yorum fotoğrafları vb.)
+wwwroot/uploads/*
+!wwwroot/uploads/.gitkeep
+
+# IDE
+.vs/
+.vscode/
+
+# Claude Code kişisel/yerel ayarlar
+.claude/settings.local.json
+
+# OS
+.DS_Store
+Thumbs.db
