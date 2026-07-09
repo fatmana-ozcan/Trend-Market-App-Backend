@@ -22,10 +22,14 @@ namespace TrendMarketServer.Controllers
         public class UpdateShipmentDto
         {
             public string Status { get; set; } = string.Empty;
-            public string? CourierName { get; set; }
-            public string? CourierPhone { get; set; }
+            public string? CarrierCode { get; set; }
             public DateTime? EstimatedDeliveryDate { get; set; }
             public string? TrackingNumber { get; set; }
+        }
+
+        public class SendMessageDto
+        {
+            public string Text { get; set; } = string.Empty;
         }
 
         private static readonly string[] ValidStatuses =
@@ -61,10 +65,13 @@ namespace TrendMarketServer.Controllers
                     s.Id,
                     s.OrderId,
                     s.Status,
+                    s.CarrierCode,
                     s.CourierName,
                     s.CourierPhone,
+                    s.CourierEmail,
                     s.EstimatedDeliveryDate,
                     s.TrackingNumber,
+                    TrackingUrl = Carriers.BuildTrackingUrl(s.CarrierCode, s.TrackingNumber),
                     order.ShippingFullName,
                     order.ShippingPhone,
                     order.ShippingCity,
@@ -94,15 +101,61 @@ namespace TrendMarketServer.Controllers
             if (!ValidStatuses.Contains(dto.Status))
                 return BadRequest(new { success = false, message = "Geçersiz durum." });
 
+            if (!string.IsNullOrEmpty(dto.CarrierCode) && Carriers.Find(dto.CarrierCode) == null)
+                return BadRequest(new { success = false, message = "Geçersiz kargo firması." });
+
+            var carrier = Carriers.Find(dto.CarrierCode);
+
             shipment.Status = dto.Status;
-            shipment.CourierName = dto.CourierName;
-            shipment.CourierPhone = dto.CourierPhone;
+            shipment.CarrierCode = dto.CarrierCode;
+            shipment.CourierName = carrier?.Name;
+            shipment.CourierPhone = carrier?.Phone;
+            shipment.CourierEmail = carrier?.Email;
             shipment.EstimatedDeliveryDate = dto.EstimatedDeliveryDate;
             shipment.TrackingNumber = dto.TrackingNumber;
             shipment.UpdatedAt = DateTime.UtcNow;
 
             await _db.SaveChangesAsync();
             return Ok(new { success = true, shipment });
+        }
+
+        // 3. Bu Gönderiye Ait Mesajları Listele (müşteri ile satıcı arasında, kargoyla ilgili)
+        [HttpGet("{id}/messages")]
+        public async Task<IActionResult> GetShipmentMessages(int id)
+        {
+            var shipment = await _db.Shipments.FindAsync(id);
+            if (shipment == null) return NotFound(new { success = false, message = "Gönderi bulunamadı." });
+            if (shipment.SellerId != CurrentSellerId) return Forbid();
+
+            var messages = await _db.ShipmentMessages
+                .Where(m => m.ShipmentId == id)
+                .OrderBy(m => m.CreatedAt)
+                .ToListAsync();
+
+            return Ok(messages);
+        }
+
+        // 4. Bu Gönderiye Mesaj Gönder (satıcı tarafı)
+        [HttpPost("{id}/messages")]
+        public async Task<IActionResult> SendShipmentMessage(int id, [FromBody] SendMessageDto dto)
+        {
+            if (string.IsNullOrWhiteSpace(dto.Text))
+                return BadRequest(new { success = false, message = "Mesaj metni zorunludur." });
+
+            var shipment = await _db.Shipments.FindAsync(id);
+            if (shipment == null) return NotFound(new { success = false, message = "Gönderi bulunamadı." });
+            if (shipment.SellerId != CurrentSellerId) return Forbid();
+
+            var message = new ShipmentMessage
+            {
+                ShipmentId = id,
+                SenderRole = ShipmentMessageSender.Seller,
+                Text = dto.Text.Trim(),
+            };
+            _db.ShipmentMessages.Add(message);
+            await _db.SaveChangesAsync();
+
+            return Ok(new { success = true, message });
         }
     }
 }

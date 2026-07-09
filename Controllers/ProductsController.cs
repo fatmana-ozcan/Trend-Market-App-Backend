@@ -28,6 +28,13 @@ namespace TrendMarketServer.Controllers
 
         private int CurrentCustomerId => int.Parse(User.FindFirstValue(ClaimTypes.NameIdentifier)!);
 
+        // Sepet, giriş yapmadan da kullanılabildiği için müşteri kimliğine değil, cihazda
+        // kalıcı üretilip her istekte gönderilen bu anonim oturum kimliğine göre ayrılır.
+        private string CartSessionId =>
+            Request.Headers.TryGetValue("X-Cart-Session", out var values) && !string.IsNullOrWhiteSpace(values.ToString())
+                ? values.ToString()
+                : "anonymous";
+
         private async Task<bool> HasPurchasedAsync(int customerId, int productId)
         {
             return await _db.Orders
@@ -47,6 +54,11 @@ namespace TrendMarketServer.Controllers
                 .ToListAsync();
             var historyByProduct = recentHistory.GroupBy(h => h.ProductId).ToDictionary(g => g.Key, g => g.ToList());
 
+            var sessionId = CartSessionId;
+            var cartQuantities = await _db.CartEntries
+                .Where(c => c.SessionId == sessionId && productIds.Contains(c.ProductId))
+                .ToDictionaryAsync(c => c.ProductId, c => c.Quantity);
+
             return products.Select(p =>
             {
                 decimal? last30DayLowestPrice = null;
@@ -62,6 +74,8 @@ namespace TrendMarketServer.Controllers
                     p.Id,
                     p.SellerId,
                     p.Name,
+                    p.NameEn,
+                    p.NameDe,
                     p.Category,
                     p.Image,
                     p.Price,
@@ -72,7 +86,7 @@ namespace TrendMarketServer.Controllers
                     p.RatingCount,
                     p.Rating,
                     IsFavorite = FavoriteProducts.Contains(p.Id),
-                    CartQuantity = CartStore.Items.TryGetValue(p.Id, out var cartItem) ? cartItem.Quantity : 0,
+                    CartQuantity = cartQuantities.TryGetValue(p.Id, out var qty) ? qty : 0,
                     Last30DayLowestPrice = last30DayLowestPrice,
                     HasPriceDrop = hasPriceDrop,
                 };
@@ -182,7 +196,7 @@ namespace TrendMarketServer.Controllers
             public string Text { get; set; } = string.Empty;
         }
 
-        // --- BELLEKTE TUTULAN FAVORİ / MESAJ VERİLERİ (sepet artık CartStore'da, ürünler veritabanında) ---
+        // --- BELLEKTE TUTULAN FAVORİ / MESAJ VERİLERİ (sepet artık veritabanında, bkz. CartEntry) ---
         private static readonly HashSet<int> FavoriteProducts = new HashSet<int>();
 
         private static readonly List<MessageItem> GlobalMessages = new List<MessageItem>
@@ -267,41 +281,56 @@ namespace TrendMarketServer.Controllers
             var product = await _db.Products.FindAsync(id);
             if (product == null) return NotFound(new { success = false, message = "Ürün bulunamadı" });
 
-            if (CartStore.Items.ContainsKey(id))
+            var sessionId = CartSessionId;
+            var entry = await _db.CartEntries.FirstOrDefaultAsync(c => c.SessionId == sessionId && c.ProductId == id);
+            if (entry != null)
             {
-                CartStore.Items[id].Quantity += 1;
+                entry.Quantity += 1;
             }
             else
             {
-                CartStore.Items[id] = new CartItem { Product = product, Quantity = 1 };
+                _db.CartEntries.Add(new CartEntry { SessionId = sessionId, ProductId = id, Quantity = 1 });
             }
+            await _db.SaveChangesAsync();
 
-            int totalItemsCount = CartStore.Items.Values.Sum(item => item.Quantity);
+            int totalItemsCount = await _db.CartEntries.Where(c => c.SessionId == sessionId).SumAsync(c => c.Quantity);
             return Ok(new { success = true, currentCartCount = totalItemsCount });
         }
 
         // 3. Sepetten Ürün Silme / Azaltma
         [HttpDelete("cart/{id}")]
-        public IActionResult RemoveFromCart(int id)
+        public async Task<IActionResult> RemoveFromCart(int id)
         {
-            if (!CartStore.Items.ContainsKey(id))
+            var sessionId = CartSessionId;
+            var entry = await _db.CartEntries.FirstOrDefaultAsync(c => c.SessionId == sessionId && c.ProductId == id);
+            if (entry == null)
                 return BadRequest(new { success = false, message = "Ürün sepette yok" });
 
-            CartStore.Items[id].Quantity -= 1;
-            if (CartStore.Items[id].Quantity <= 0)
+            entry.Quantity -= 1;
+            if (entry.Quantity <= 0)
             {
-                CartStore.Items.Remove(id);
+                _db.CartEntries.Remove(entry);
             }
+            await _db.SaveChangesAsync();
 
-            int totalItemsCount = CartStore.Items.Values.Sum(item => item.Quantity);
+            int totalItemsCount = await _db.CartEntries.Where(c => c.SessionId == sessionId).SumAsync(c => c.Quantity);
             return Ok(new { success = true, currentCartCount = totalItemsCount });
         }
 
         // 4. Sepet Detaylarını Getirme
         [HttpGet("cart-details")]
-        public IActionResult GetCartDetails()
+        public async Task<IActionResult> GetCartDetails()
         {
-            return Ok(CartStore.Items.Values.ToList());
+            var sessionId = CartSessionId;
+            var entries = await _db.CartEntries.Where(c => c.SessionId == sessionId).ToListAsync();
+            var productIds = entries.Select(e => e.ProductId).ToList();
+            var products = await _db.Products.Where(p => productIds.Contains(p.Id)).ToDictionaryAsync(p => p.Id);
+
+            var result = entries
+                .Where(e => products.ContainsKey(e.ProductId))
+                .Select(e => new { product = products[e.ProductId], quantity = e.Quantity });
+
+            return Ok(result);
         }
 
         // 5. Favorilere Ekleme / Kaldırma
@@ -322,14 +351,18 @@ namespace TrendMarketServer.Controllers
             return Ok(new { success = true, favoriteCount = FavoriteProducts.Count, isFavorite });
         }
 
-        // 6. Ürüne Puan Verme
+        // 6. Ürüne Puan Verme (sadece bu ürünü satın alan müşteriler)
         [HttpPost("rate/{id}")]
+        [Authorize(Roles = "Customer")]
         public async Task<IActionResult> RateProduct(int id, [FromQuery] int score)
         {
             if (score < 1 || score > 5) return BadRequest("Puan 1-5 arasında olmalıdır.");
 
             var product = await _db.Products.FindAsync(id);
             if (product == null) return NotFound("Ürün bulunamadı");
+
+            if (!await HasPurchasedAsync(CurrentCustomerId, id))
+                return BadRequest(new { success = false, message = "Bu ürünü satın alan müşteriler puan verebilir." });
 
             product.RatingSum += score;
             product.RatingCount += 1;

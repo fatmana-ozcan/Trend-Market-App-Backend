@@ -44,7 +44,17 @@ namespace TrendMarketServer.Controllers
             public int AddressId { get; set; }
         }
 
+        public class SendMessageDto
+        {
+            public string Text { get; set; } = string.Empty;
+        }
+
         private int CurrentCustomerId => int.Parse(User.FindFirstValue(ClaimTypes.NameIdentifier)!);
+
+        private string CartSessionId =>
+            Request.Headers.TryGetValue("X-Cart-Session", out var values) && !string.IsNullOrWhiteSpace(values.ToString())
+                ? values.ToString()
+                : "anonymous";
 
         private async Task<decimal> GetCouponBalanceAsync(int customerId)
         {
@@ -61,7 +71,9 @@ namespace TrendMarketServer.Controllers
         [HttpPost("checkout/request-code")]
         public async Task<IActionResult> RequestCheckoutCode([FromBody] CheckoutDto dto)
         {
-            if (CartStore.Items.Count == 0)
+            var sessionId = CartSessionId;
+            var cartEntries = await _db.CartEntries.Where(c => c.SessionId == sessionId).ToListAsync();
+            if (cartEntries.Count == 0)
                 return BadRequest(new { success = false, message = "Sepetiniz boş." });
 
             var cardError = ValidateCard(dto);
@@ -72,7 +84,11 @@ namespace TrendMarketServer.Controllers
             if (address == null || address.CustomerId != CurrentCustomerId)
                 return BadRequest(new { success = false, message = "Geçerli bir teslimat adresi seçin." });
 
-            var cartTotal = CartStore.Items.Values.Sum(i => i.Product.Price * i.Quantity);
+            var cartProductIds = cartEntries.Select(c => c.ProductId).ToList();
+            var cartProducts = await _db.Products.Where(p => cartProductIds.Contains(p.Id)).ToDictionaryAsync(p => p.Id);
+            var cartTotal = cartEntries
+                .Where(c => cartProducts.ContainsKey(c.ProductId))
+                .Sum(c => cartProducts[c.ProductId].Price * c.Quantity);
             var balance = await GetCouponBalanceAsync(CurrentCustomerId);
             if (dto.CouponAmountToUse < 0 || dto.CouponAmountToUse > balance || dto.CouponAmountToUse > cartTotal)
                 return BadRequest(new { success = false, message = "Geçersiz kupon tutarı." });
@@ -99,27 +115,28 @@ namespace TrendMarketServer.Controllers
 
             var dto = (CheckoutDto)entry.Payload!;
 
-            if (CartStore.Items.Count == 0)
+            var sessionId = CartSessionId;
+            var cartEntries = await _db.CartEntries.Where(c => c.SessionId == sessionId).ToListAsync();
+            if (cartEntries.Count == 0)
                 return BadRequest(new { success = false, message = "Sepetiniz boş." });
 
             var address = await _db.Addresses.FindAsync(dto.AddressId);
             if (address == null || address.CustomerId != CurrentCustomerId)
                 return BadRequest(new { success = false, message = "Geçerli bir teslimat adresi seçin." });
 
-            var productIds = CartStore.Items.Keys.ToList();
+            var productIds = cartEntries.Select(c => c.ProductId).ToList();
             var products = await _db.Products.Where(p => productIds.Contains(p.Id)).ToDictionaryAsync(p => p.Id);
 
-            foreach (var id in productIds)
+            foreach (var cartEntry in cartEntries)
             {
-                var cartItem = CartStore.Items[id];
-                if (!products.TryGetValue(id, out var product) || product.Stock < cartItem.Quantity)
+                if (!products.TryGetValue(cartEntry.ProductId, out var product) || product.Stock < cartEntry.Quantity)
                 {
-                    var name = products.TryGetValue(id, out var p2) ? p2.Name : cartItem.Product.Name;
+                    var name = products.TryGetValue(cartEntry.ProductId, out var p2) ? p2.Name : $"#{cartEntry.ProductId}";
                     return BadRequest(new { success = false, message = $"{name} için yeterli stok yok." });
                 }
             }
 
-            var cartTotal = CartStore.Items.Values.Sum(i => i.Product.Price * i.Quantity);
+            var cartTotal = cartEntries.Sum(c => products[c.ProductId].Price * c.Quantity);
             var balance = await GetCouponBalanceAsync(CurrentCustomerId);
             var couponToUse = Math.Max(0, Math.Min(Math.Min(dto.CouponAmountToUse, balance), cartTotal));
 
@@ -149,7 +166,7 @@ namespace TrendMarketServer.Controllers
             }
 
             // Sepeti satıcıya göre grupla — karışık sepette her satıcı sadece kendi gönderisini yönetir.
-            var groupedBySeller = CartStore.Items.Values.GroupBy(i => i.Product.SellerId);
+            var groupedBySeller = cartEntries.GroupBy(c => products[c.ProductId].SellerId);
 
             foreach (var group in groupedBySeller)
             {
@@ -162,9 +179,9 @@ namespace TrendMarketServer.Controllers
                 _db.Shipments.Add(shipment);
                 await _db.SaveChangesAsync(); // Id almak için
 
-                foreach (var cartItem in group)
+                foreach (var cartEntry in group)
                 {
-                    var product = products[cartItem.Product.Id];
+                    var product = products[cartEntry.ProductId];
 
                     _db.OrderItems.Add(new OrderItem
                     {
@@ -173,17 +190,17 @@ namespace TrendMarketServer.Controllers
                         ProductId = product.Id,
                         ProductName = product.Name,
                         ProductImage = product.Image,
-                        Quantity = cartItem.Quantity,
+                        Quantity = cartEntry.Quantity,
                         UnitPrice = product.Price,
                         SellerId = product.SellerId,
                     });
 
-                    product.Stock -= cartItem.Quantity;
-                    product.SoldCount += cartItem.Quantity;
-                    product.TotalRevenue += product.Price * cartItem.Quantity;
-                    product.TotalCost += product.CostPrice * cartItem.Quantity;
+                    product.Stock -= cartEntry.Quantity;
+                    product.SoldCount += cartEntry.Quantity;
+                    product.TotalRevenue += product.Price * cartEntry.Quantity;
+                    product.TotalCost += product.CostPrice * cartEntry.Quantity;
 
-                    var reward = Math.Round(product.Price * cartItem.Quantity * CouponEarnRate, 2);
+                    var reward = Math.Round(product.Price * cartEntry.Quantity * CouponEarnRate, 2);
                     if (reward > 0)
                     {
                         _db.CouponTransactions.Add(new CouponTransaction
@@ -197,7 +214,7 @@ namespace TrendMarketServer.Controllers
                 }
             }
 
-            CartStore.Items.Clear();
+            _db.CartEntries.RemoveRange(cartEntries);
             await _db.SaveChangesAsync();
             VerificationStore.Entries.Remove(key);
 
@@ -235,10 +252,13 @@ namespace TrendMarketServer.Controllers
                     s.Id,
                     s.SellerId,
                     s.Status,
+                    s.CarrierCode,
                     s.CourierName,
                     s.CourierPhone,
+                    s.CourierEmail,
                     s.EstimatedDeliveryDate,
                     s.TrackingNumber,
+                    TrackingUrl = Carriers.BuildTrackingUrl(s.CarrierCode, s.TrackingNumber),
                     Items = items.Where(i => i.ShipmentId == s.Id).Select(i => new
                     {
                         i.ProductId,
@@ -277,6 +297,49 @@ namespace TrendMarketServer.Controllers
 
             await _db.SaveChangesAsync();
             return Ok(new { success = true });
+        }
+
+        // 4. Bu Gönderiye Ait Mesajları Listele (müşteri tarafı — kargo hakkında satıcıyla yazışma)
+        [HttpGet("shipments/{shipmentId}/messages")]
+        public async Task<IActionResult> GetShipmentMessages(int shipmentId)
+        {
+            var shipment = await _db.Shipments.FindAsync(shipmentId);
+            if (shipment == null) return NotFound(new { success = false, message = "Gönderi bulunamadı." });
+
+            var order = await _db.Orders.FindAsync(shipment.OrderId);
+            if (order == null || order.CustomerId != CurrentCustomerId) return Forbid();
+
+            var messages = await _db.ShipmentMessages
+                .Where(m => m.ShipmentId == shipmentId)
+                .OrderBy(m => m.CreatedAt)
+                .ToListAsync();
+
+            return Ok(messages);
+        }
+
+        // 5. Bu Gönderiye Mesaj Gönder (müşteri tarafı)
+        [HttpPost("shipments/{shipmentId}/messages")]
+        public async Task<IActionResult> SendShipmentMessage(int shipmentId, [FromBody] SendMessageDto dto)
+        {
+            if (string.IsNullOrWhiteSpace(dto.Text))
+                return BadRequest(new { success = false, message = "Mesaj metni zorunludur." });
+
+            var shipment = await _db.Shipments.FindAsync(shipmentId);
+            if (shipment == null) return NotFound(new { success = false, message = "Gönderi bulunamadı." });
+
+            var order = await _db.Orders.FindAsync(shipment.OrderId);
+            if (order == null || order.CustomerId != CurrentCustomerId) return Forbid();
+
+            var message = new ShipmentMessage
+            {
+                ShipmentId = shipmentId,
+                SenderRole = ShipmentMessageSender.Customer,
+                Text = dto.Text.Trim(),
+            };
+            _db.ShipmentMessages.Add(message);
+            await _db.SaveChangesAsync();
+
+            return Ok(new { success = true, message });
         }
 
         private static string? ValidateCard(CheckoutDto dto)

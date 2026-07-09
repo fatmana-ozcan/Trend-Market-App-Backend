@@ -60,6 +60,7 @@ using (var scope = app.Services.CreateScope())
     DbSeeder.EnsureBaselineMigrationMarked(db);
     db.Database.Migrate();
     DbSeeder.Seed(db);
+    DbSeeder.BackfillProductNameTranslations(db);
     DbSeeder.SeedPriceHistoryIfMissing(db);
 }
 

@@ -2,6 +2,7 @@
 using System;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using TrendMarketServer.Data;
 
@@ -10,9 +11,11 @@ using TrendMarketServer.Data;
 namespace TrendMarketServer.Migrations
 {
     [DbContext(typeof(AppDbContext))]
-    partial class AppDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260709065949_AddProductNameTranslations")]
+    partial class AddProductNameTranslations
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder.HasAnnotation("ProductVersion", "8.0.11");
@@ -56,30 +59,6 @@ namespace TrendMarketServer.Migrations
                     b.HasKey("Id");
 
                     b.ToTable("Addresses");
-                });
-
-            modelBuilder.Entity("TrendMarketServer.Models.CartEntry", b =>
-                {
-                    b.Property<int>("Id")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("INTEGER");
-
-                    b.Property<int>("ProductId")
-                        .HasColumnType("INTEGER");
-
-                    b.Property<int>("Quantity")
-                        .HasColumnType("INTEGER");
-
-                    b.Property<string>("SessionId")
-                        .IsRequired()
-                        .HasColumnType("TEXT");
-
-                    b.HasKey("Id");
-
-                    b.HasIndex("SessionId", "ProductId")
-                        .IsUnique();
-
-                    b.ToTable("CartEntries");
                 });
 
             modelBuilder.Entity("TrendMarketServer.Models.CouponTransaction", b =>
@@ -391,12 +370,6 @@ namespace TrendMarketServer.Migrations
                         .ValueGeneratedOnAdd()
                         .HasColumnType("INTEGER");
 
-                    b.Property<string>("CarrierCode")
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("CourierEmail")
-                        .HasColumnType("TEXT");
-
                     b.Property<string>("CourierName")
                         .HasColumnType("TEXT");
 
@@ -425,31 +398,6 @@ namespace TrendMarketServer.Migrations
                     b.HasKey("Id");
 
                     b.ToTable("Shipments");
-                });
-
-            modelBuilder.Entity("TrendMarketServer.Models.ShipmentMessage", b =>
-                {
-                    b.Property<int>("Id")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("INTEGER");
-
-                    b.Property<DateTime>("CreatedAt")
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("SenderRole")
-                        .IsRequired()
-                        .HasColumnType("TEXT");
-
-                    b.Property<int>("ShipmentId")
-                        .HasColumnType("INTEGER");
-
-                    b.Property<string>("Text")
-                        .IsRequired()
-                        .HasColumnType("TEXT");
-
-                    b.HasKey("Id");
-
-                    b.ToTable("ShipmentMessages");
                 });
 #pragma warning restore 612, 618
         }

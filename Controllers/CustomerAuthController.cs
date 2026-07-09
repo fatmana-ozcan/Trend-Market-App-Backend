@@ -1,3 +1,5 @@
+using System.Security.Claims;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using TrendMarketServer.Data;
@@ -17,6 +19,18 @@ namespace TrendMarketServer.Controllers
         {
             _db = db;
             _tokenService = tokenService;
+        }
+
+        private int CurrentCustomerId => int.Parse(User.FindFirstValue(ClaimTypes.NameIdentifier)!);
+
+        // Profil ekranı için hesap bilgileri (login/register yanıtı sadece isim döner, e-posta/telefon içermez)
+        [HttpGet("me")]
+        [Authorize(Roles = "Customer")]
+        public async Task<IActionResult> GetMe()
+        {
+            var customer = await _db.Customers.FindAsync(CurrentCustomerId);
+            if (customer == null) return NotFound();
+            return Ok(new { name = customer.Name, email = customer.Email, phone = customer.Phone });
         }
 
         public class RegisterDto

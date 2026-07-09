@@ -7,7 +7,7 @@ public class VerificationEntry
     public object? Payload { get; set; }
 }
 
-// Basit, bellek içi doğrulama kodu deposu (CartStore ile aynı yaklaşım). Demo modunda
+// Basit, bellek içi doğrulama kodu deposu. Demo modunda
 // gerçek bir SMS servisi bağlı değil; kod burada saklanır ve isteyen uca "demoCode"
 // olarak döner. Gerçek SMS entegrasyonunda bu depo aynı kalır, sadece kodun SMS ile
 // gönderildiği yer eklenir ve "demoCode" alanı response'tan çıkarılır.

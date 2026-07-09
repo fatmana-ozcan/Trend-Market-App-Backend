@@ -18,6 +18,8 @@ public class AppDbContext : DbContext
     public DbSet<ProductPriceHistory> ProductPriceHistories => Set<ProductPriceHistory>();
     public DbSet<CouponTransaction> CouponTransactions => Set<CouponTransaction>();
     public DbSet<ProductView> ProductViews => Set<ProductView>();
+    public DbSet<ShipmentMessage> ShipmentMessages => Set<ShipmentMessage>();
+    public DbSet<CartEntry> CartEntries => Set<CartEntry>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -31,6 +33,10 @@ public class AppDbContext : DbContext
 
         modelBuilder.Entity<ProductView>()
             .HasIndex(v => new { v.CustomerId, v.ProductId })
+            .IsUnique();
+
+        modelBuilder.Entity<CartEntry>()
+            .HasIndex(c => new { c.SessionId, c.ProductId })
             .IsUnique();
     }
 }
