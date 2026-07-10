@@ -227,6 +227,15 @@ namespace TrendMarketServer.Controllers
             return Ok(shaped);
         }
 
+        // 1b. Alt menüdeki sepet/favori rozetleri için toplam adet
+        [HttpGet("counts")]
+        public async Task<IActionResult> GetCounts()
+        {
+            var sessionId = CartSessionId;
+            var cartCount = await _db.CartEntries.Where(c => c.SessionId == sessionId).SumAsync(c => c.Quantity);
+            return Ok(new { cartCount, favoriteCount = FavoriteProducts.Count });
+        }
+
         // 12. Önceden Gezdiğim Ürünler
         [HttpGet("recently-viewed")]
         [Authorize(Roles = "Customer")]
