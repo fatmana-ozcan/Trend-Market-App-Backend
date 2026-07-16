@@ -14,11 +14,13 @@ namespace TrendMarketServer.Controllers
     {
         private readonly AppDbContext _db;
         private readonly TokenService _tokenService;
+        private readonly EmailService _emailService;
 
-        public CustomerAuthController(AppDbContext db, TokenService tokenService)
+        public CustomerAuthController(AppDbContext db, TokenService tokenService, EmailService emailService)
         {
             _db = db;
             _tokenService = tokenService;
+            _emailService = emailService;
         }
 
         private int CurrentCustomerId => int.Parse(User.FindFirstValue(ClaimTypes.NameIdentifier)!);
@@ -115,8 +117,16 @@ namespace TrendMarketServer.Controllers
                 ExpiresAt = DateTime.UtcNow.AddMinutes(5),
             };
 
-            // Demo modu: gerçek SMS servisi bağlı değil, kod response içinde dönülüyor.
-            return Ok(new { success = true, message = "Doğrulama kodu telefonunuza gönderildi.", demoCode = code });
+            var emailSent = await _emailService.SendVerificationCodeAsync(customer.Email, customer.Name, code, "Şifre sıfırlama");
+
+            // E-posta gönderimi yapılandırılmamışsa (bkz. EmailService) demo modunda kod response
+            // içinde de dönülür, böylece SMTP kurulmadan da uygulama test edilebilir.
+            return Ok(new
+            {
+                success = true,
+                message = emailSent ? "Doğrulama kodu e-posta adresinize gönderildi." : "Doğrulama kodu telefonunuza gönderildi.",
+                demoCode = emailSent ? null : code,
+            });
         }
 
         [HttpPost("reset-password")]

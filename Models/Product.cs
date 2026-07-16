@@ -10,6 +10,9 @@ public class Product
     public string? NameEn { get; set; }
     public string? NameDe { get; set; }
     public string Category { get; set; } = string.Empty;
+    public string? Brand { get; set; }
+    public string? Color { get; set; }
+    public string? Size { get; set; }
     public string Image { get; set; } = string.Empty;
     public decimal Price { get; set; }
     public decimal CostPrice { get; set; }

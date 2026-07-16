@@ -23,6 +23,18 @@ public class TokenService
             new Claim(ClaimTypes.Email, seller.Email),
             new Claim(ClaimTypes.Role, "Seller"),
             new Claim("storeName", seller.StoreName),
+            new Claim("sv", seller.SessionVersion.ToString()),
+        };
+        return BuildToken(claims);
+    }
+
+    public string GenerateToken(Admin admin)
+    {
+        var claims = new[]
+        {
+            new Claim(ClaimTypes.NameIdentifier, admin.Id.ToString()),
+            new Claim(ClaimTypes.Email, admin.Email),
+            new Claim(ClaimTypes.Role, "Admin"),
         };
         return BuildToken(claims);
     }
@@ -35,6 +47,7 @@ public class TokenService
             new Claim(ClaimTypes.Email, customer.Email),
             new Claim(ClaimTypes.Role, "Customer"),
             new Claim("name", customer.Name),
+            new Claim("sv", customer.SessionVersion.ToString()),
         };
         return BuildToken(claims);
     }

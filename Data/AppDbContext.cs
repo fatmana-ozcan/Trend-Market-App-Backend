@@ -20,6 +20,10 @@ public class AppDbContext : DbContext
     public DbSet<ProductView> ProductViews => Set<ProductView>();
     public DbSet<ShipmentMessage> ShipmentMessages => Set<ShipmentMessage>();
     public DbSet<CartEntry> CartEntries => Set<CartEntry>();
+    public DbSet<ProductVariant> ProductVariants => Set<ProductVariant>();
+    public DbSet<ProductImage> ProductImages => Set<ProductImage>();
+    public DbSet<ProductNotifyRequest> ProductNotifyRequests => Set<ProductNotifyRequest>();
+    public DbSet<Admin> Admins => Set<Admin>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -35,8 +39,18 @@ public class AppDbContext : DbContext
             .HasIndex(v => new { v.CustomerId, v.ProductId })
             .IsUnique();
 
+        // Aynı ürünün farklı renk/beden varyantları artık ayrı sepet satırları olabildiğinden
+        // (bkz. CartEntry.ColorVariantId/SizeVariantId), tekillik bu üç alanın birlikte kombinasyonuna göre uygulanır.
         modelBuilder.Entity<CartEntry>()
-            .HasIndex(c => new { c.SessionId, c.ProductId })
+            .HasIndex(c => new { c.SessionId, c.ProductId, c.ColorVariantId, c.SizeVariantId })
+            .IsUnique();
+
+        modelBuilder.Entity<ProductNotifyRequest>()
+            .HasIndex(n => new { n.CustomerId, n.ProductId, n.VariantId })
+            .IsUnique();
+
+        modelBuilder.Entity<Admin>()
+            .HasIndex(a => a.Email)
             .IsUnique();
     }
 }

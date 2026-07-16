@@ -12,11 +12,13 @@ namespace TrendMarketServer.Controllers
     {
         private readonly AppDbContext _db;
         private readonly TokenService _tokenService;
+        private readonly EmailService _emailService;
 
-        public AuthController(AppDbContext db, TokenService tokenService)
+        public AuthController(AppDbContext db, TokenService tokenService, EmailService emailService)
         {
             _db = db;
             _tokenService = tokenService;
+            _emailService = emailService;
         }
 
         public class RegisterDto
@@ -65,13 +67,14 @@ namespace TrendMarketServer.Controllers
                 Email = normalizedEmail,
                 Phone = dto.Phone.Trim(),
                 PasswordHash = BCrypt.Net.BCrypt.HashPassword(dto.Password),
+                IsApproved = false,
             };
 
             _db.Sellers.Add(seller);
             await _db.SaveChangesAsync();
 
-            var token = _tokenService.GenerateToken(seller);
-            return Ok(new { success = true, token, sellerId = seller.Id, storeName = seller.StoreName });
+            // Onay verilene kadar token dönülmez — hesap var ama satıcı olarak giriş yapamaz.
+            return Ok(new { success = true, pendingApproval = true, message = "Kaydınız alındı. Satıcı hesabınız yönetici onayının ardından aktif olacaktır." });
         }
 
         [HttpPost("login")]
@@ -81,6 +84,9 @@ namespace TrendMarketServer.Controllers
             var seller = await _db.Sellers.FirstOrDefaultAsync(s => s.Email == normalizedEmail);
             if (seller == null || !BCrypt.Net.BCrypt.Verify(dto.Password, seller.PasswordHash))
                 return Unauthorized(new { success = false, message = "E-posta veya şifre hatalı." });
+
+            if (!seller.IsApproved)
+                return StatusCode(403, new { success = false, pendingApproval = true, message = "Hesabınız henüz onaylanmadı. Yönetici onayı bekleniyor." });
 
             var token = _tokenService.GenerateToken(seller);
             return Ok(new { success = true, token, sellerId = seller.Id, storeName = seller.StoreName });
@@ -101,8 +107,16 @@ namespace TrendMarketServer.Controllers
                 ExpiresAt = DateTime.UtcNow.AddMinutes(5),
             };
 
-            // Demo modu: gerçek SMS servisi bağlı değil, kod response içinde dönülüyor.
-            return Ok(new { success = true, message = "Doğrulama kodu telefonunuza gönderildi.", demoCode = code });
+            var emailSent = await _emailService.SendVerificationCodeAsync(seller.Email, seller.StoreName, code, "Şifre sıfırlama");
+
+            // E-posta gönderimi yapılandırılmamışsa (bkz. EmailService) demo modunda kod response
+            // içinde de dönülür, böylece SMTP kurulmadan da uygulama test edilebilir.
+            return Ok(new
+            {
+                success = true,
+                message = emailSent ? "Doğrulama kodu e-posta adresinize gönderildi." : "Doğrulama kodu telefonunuza gönderildi.",
+                demoCode = emailSent ? null : code,
+            });
         }
 
         [HttpPost("reset-password")]

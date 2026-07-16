@@ -4,6 +4,7 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using TrendMarketServer.Data;
 using TrendMarketServer.Models;
+using TrendMarketServer.Services;
 
 namespace TrendMarketServer.Controllers
 {
@@ -12,12 +13,12 @@ namespace TrendMarketServer.Controllers
     public class ProductsController : ControllerBase
     {
         private readonly AppDbContext _db;
-        private readonly IWebHostEnvironment _env;
+        private readonly ImageStorageService _imageStorage;
 
-        public ProductsController(AppDbContext db, IWebHostEnvironment env)
+        public ProductsController(AppDbContext db, ImageStorageService imageStorage)
         {
             _db = db;
-            _env = env;
+            _imageStorage = imageStorage;
         }
 
         public class ReviewDto
@@ -55,9 +56,26 @@ namespace TrendMarketServer.Controllers
             var historyByProduct = recentHistory.GroupBy(h => h.ProductId).ToDictionary(g => g.Key, g => g.ToList());
 
             var sessionId = CartSessionId;
+            // Bir ürünün birden fazla varyant kombinasyonuyla (farklı renk/beden) ayrı sepet
+            // satırları olabileceğinden, ürün başına adet toplamı GroupBy ile alınır — aksi halde
+            // ToDictionaryAsync tekrarlı ProductId anahtarında hata fırlatırdı.
             var cartQuantities = await _db.CartEntries
                 .Where(c => c.SessionId == sessionId && productIds.Contains(c.ProductId))
-                .ToDictionaryAsync(c => c.ProductId, c => c.Quantity);
+                .GroupBy(c => c.ProductId)
+                .Select(g => new { ProductId = g.Key, Quantity = g.Sum(c => c.Quantity) })
+                .ToDictionaryAsync(x => x.ProductId, x => x.Quantity);
+
+            var variants = await _db.ProductVariants
+                .Where(v => productIds.Contains(v.ProductId))
+                .ToListAsync();
+            var variantsByProduct = variants.GroupBy(v => v.ProductId).ToDictionary(g => g.Key, g => g.ToList());
+
+            // Kapak görseli (Product.Image) hariç ek galeri görselleri — bkz. ProductImage.
+            var galleryImages = await _db.ProductImages
+                .Where(i => productIds.Contains(i.ProductId))
+                .OrderBy(i => i.SortOrder)
+                .ToListAsync();
+            var imagesByProduct = galleryImages.GroupBy(i => i.ProductId).ToDictionary(g => g.Key, g => g.ToList());
 
             return products.Select(p =>
             {
@@ -69,6 +87,14 @@ namespace TrendMarketServer.Controllers
                     hasPriceDrop = rows.Any(r => r.Price > p.Price);
                 }
 
+                var productVariants = variantsByProduct.TryGetValue(p.Id, out var v)
+                    ? v.Select(x => (object)new { x.Id, x.Color, x.Size, x.Image, x.Stock, x.Price }).ToList()
+                    : new List<object>();
+
+                var productImages = imagesByProduct.TryGetValue(p.Id, out var imgs)
+                    ? imgs.Select(x => (object)new { x.Id, x.Url }).ToList()
+                    : new List<object>();
+
                 return (object)new
                 {
                     p.Id,
@@ -77,6 +103,9 @@ namespace TrendMarketServer.Controllers
                     p.NameEn,
                     p.NameDe,
                     p.Category,
+                    p.Brand,
+                    p.Color,
+                    p.Size,
                     p.Image,
                     p.Price,
                     p.CostPrice,
@@ -89,25 +118,10 @@ namespace TrendMarketServer.Controllers
                     CartQuantity = cartQuantities.TryGetValue(p.Id, out var qty) ? qty : 0,
                     Last30DayLowestPrice = last30DayLowestPrice,
                     HasPriceDrop = hasPriceDrop,
+                    Variants = productVariants,
+                    Images = productImages,
                 };
             }).ToList();
-        }
-
-        private async Task<string> SaveReviewImageAsync(IFormFile image)
-        {
-            var uploadsRoot = Path.Combine(_env.ContentRootPath, "wwwroot", "uploads");
-            Directory.CreateDirectory(uploadsRoot);
-
-            var ext = Path.GetExtension(image.FileName);
-            var fileName = $"{Guid.NewGuid()}{ext}";
-            var filePath = Path.Combine(uploadsRoot, fileName);
-
-            using (var stream = new FileStream(filePath, FileMode.Create))
-            {
-                await image.CopyToAsync(stream);
-            }
-
-            return $"/uploads/{fileName}";
         }
 
         // 9. Ürün Yorumlarını Listele (herkese açık)
@@ -162,7 +176,9 @@ namespace TrendMarketServer.Controllers
             string? imageUrl = null;
             if (dto.Image != null)
             {
-                imageUrl = await SaveReviewImageAsync(dto.Image);
+                imageUrl = await _imageStorage.SaveAsync(dto.Image);
+                if (imageUrl == null)
+                    return BadRequest(new { success = false, message = "Desteklenmeyen veya bozuk görsel dosyası." });
             }
 
             var review = new ProductReview
@@ -197,7 +213,11 @@ namespace TrendMarketServer.Controllers
         }
 
         // --- BELLEKTE TUTULAN FAVORİ / MESAJ VERİLERİ (sepet artık veritabanında, bkz. CartEntry) ---
-        private static readonly HashSet<int> FavoriteProducts = new HashSet<int>();
+        internal static readonly HashSet<int> FavoriteProducts = new HashSet<int>();
+
+        // Bir ürün silindiğinde favori listesinde hayalet (var olmayan ürüne ait) bir kayıt
+        // kalmasın diye SellerProductsController.DeleteProduct tarafından çağrılır.
+        internal static void RemoveFromFavorites(int productId) => FavoriteProducts.Remove(productId);
 
         private static readonly List<MessageItem> GlobalMessages = new List<MessageItem>
         {
@@ -227,13 +247,31 @@ namespace TrendMarketServer.Controllers
             return Ok(shaped);
         }
 
+        // 1c. Sistemde şu an kullanılan tüm kategori adları — satıcı ürün formunda hem
+        // önceden tanımlı hem de başka satıcıların eklediği özel kategorileri göstermek için.
+        [HttpGet("categories")]
+        public async Task<IActionResult> GetCategories()
+        {
+            var categories = await _db.Products
+                .Select(p => p.Category)
+                .Where(c => c != null && c != "")
+                .Distinct()
+                .OrderBy(c => c)
+                .ToListAsync();
+            return Ok(categories);
+        }
+
         // 1b. Alt menüdeki sepet/favori rozetleri için toplam adet
         [HttpGet("counts")]
         public async Task<IActionResult> GetCounts()
         {
             var sessionId = CartSessionId;
             var cartCount = await _db.CartEntries.Where(c => c.SessionId == sessionId).SumAsync(c => c.Quantity);
-            return Ok(new { cartCount, favoriteCount = FavoriteProducts.Count });
+            // Silinen ürünlere ait hayalet favori kayıtları rozet sayısını şişirmesin diye
+            // sadece hâlâ var olan ürünlere göre sayıyoruz.
+            var favoriteIds = FavoriteProducts.ToList();
+            var favoriteCount = await _db.Products.CountAsync(p => favoriteIds.Contains(p.Id));
+            return Ok(new { cartCount, favoriteCount });
         }
 
         // 12. Önceden Gezdiğim Ürünler
@@ -283,22 +321,36 @@ namespace TrendMarketServer.Controllers
             return Ok(new { success = true });
         }
 
-        // 2. Sepete Ürün Ekleme
+        // 2. Sepete Ürün Ekleme (renk/beden seçiliyse aynı ürünün farklı varyantları ayrı satır olarak tutulur)
         [HttpPost("cart/{id}")]
-        public async Task<IActionResult> AddToCart(int id)
+        public async Task<IActionResult> AddToCart(int id, [FromQuery] int? colorVariantId = null, [FromQuery] int? sizeVariantId = null)
         {
             var product = await _db.Products.FindAsync(id);
             if (product == null) return NotFound(new { success = false, message = "Ürün bulunamadı" });
 
+            if (colorVariantId.HasValue && !await _db.ProductVariants.AnyAsync(v => v.Id == colorVariantId.Value && v.ProductId == id))
+                return BadRequest(new { success = false, message = "Geçersiz renk seçeneği." });
+            if (sizeVariantId.HasValue && !await _db.ProductVariants.AnyAsync(v => v.Id == sizeVariantId.Value && v.ProductId == id))
+                return BadRequest(new { success = false, message = "Geçersiz beden seçeneği." });
+
             var sessionId = CartSessionId;
-            var entry = await _db.CartEntries.FirstOrDefaultAsync(c => c.SessionId == sessionId && c.ProductId == id);
+            var entry = await _db.CartEntries.FirstOrDefaultAsync(c =>
+                c.SessionId == sessionId && c.ProductId == id &&
+                c.ColorVariantId == colorVariantId && c.SizeVariantId == sizeVariantId);
             if (entry != null)
             {
                 entry.Quantity += 1;
             }
             else
             {
-                _db.CartEntries.Add(new CartEntry { SessionId = sessionId, ProductId = id, Quantity = 1 });
+                _db.CartEntries.Add(new CartEntry
+                {
+                    SessionId = sessionId,
+                    ProductId = id,
+                    Quantity = 1,
+                    ColorVariantId = colorVariantId,
+                    SizeVariantId = sizeVariantId,
+                });
             }
             await _db.SaveChangesAsync();
 
@@ -306,12 +358,14 @@ namespace TrendMarketServer.Controllers
             return Ok(new { success = true, currentCartCount = totalItemsCount });
         }
 
-        // 3. Sepetten Ürün Silme / Azaltma
+        // 3. Sepetten Ürün Silme / Azaltma (aynı ürünün hangi varyant satırından azaltılacağını ayırt eder)
         [HttpDelete("cart/{id}")]
-        public async Task<IActionResult> RemoveFromCart(int id)
+        public async Task<IActionResult> RemoveFromCart(int id, [FromQuery] int? colorVariantId = null, [FromQuery] int? sizeVariantId = null)
         {
             var sessionId = CartSessionId;
-            var entry = await _db.CartEntries.FirstOrDefaultAsync(c => c.SessionId == sessionId && c.ProductId == id);
+            var entry = await _db.CartEntries.FirstOrDefaultAsync(c =>
+                c.SessionId == sessionId && c.ProductId == id &&
+                c.ColorVariantId == colorVariantId && c.SizeVariantId == sizeVariantId);
             if (entry == null)
                 return BadRequest(new { success = false, message = "Ürün sepette yok" });
 
@@ -326,7 +380,20 @@ namespace TrendMarketServer.Controllers
             return Ok(new { success = true, currentCartCount = totalItemsCount });
         }
 
-        // 4. Sepet Detaylarını Getirme
+        // 3b. Sepeti tamamen boşaltma — müşteri giriş/kayıt yaptığında, giriş öncesi anonim
+        // oturuma ait sepetin hesaba taşınmaması için çağrılır (bkz. CustomerAuthScreen).
+        [HttpDelete("cart")]
+        public async Task<IActionResult> ClearCart()
+        {
+            var sessionId = CartSessionId;
+            var entries = _db.CartEntries.Where(c => c.SessionId == sessionId);
+            _db.CartEntries.RemoveRange(entries);
+            await _db.SaveChangesAsync();
+            return Ok(new { success = true });
+        }
+
+        // 4. Sepet Detaylarını Getirme (renk/beden varyantı seçiliyse etiketi ve o varyanta özel
+        // fiyatı da döner — bkz. ProductVariant.Price, sepetteki tutar ve ödeme bu fiyat üzerinden hesaplanır).
         [HttpGet("cart-details")]
         public async Task<IActionResult> GetCartDetails()
         {
@@ -335,9 +402,34 @@ namespace TrendMarketServer.Controllers
             var productIds = entries.Select(e => e.ProductId).ToList();
             var products = await _db.Products.Where(p => productIds.Contains(p.Id)).ToDictionaryAsync(p => p.Id);
 
+            var variantIds = entries
+                .SelectMany(e => new[] { e.ColorVariantId, e.SizeVariantId })
+                .Where(id => id.HasValue)
+                .Select(id => id!.Value)
+                .ToList();
+            var variants = await _db.ProductVariants.Where(v => variantIds.Contains(v.Id)).ToDictionaryAsync(v => v.Id);
+
             var result = entries
                 .Where(e => products.ContainsKey(e.ProductId))
-                .Select(e => new { product = products[e.ProductId], quantity = e.Quantity });
+                .Select(e =>
+                {
+                    var product = products[e.ProductId];
+                    var colorVariant = e.ColorVariantId.HasValue && variants.TryGetValue(e.ColorVariantId.Value, out var cv) ? cv : null;
+                    var sizeVariant = e.SizeVariantId.HasValue && variants.TryGetValue(e.SizeVariantId.Value, out var sv) ? sv : null;
+                    var effectiveUnitPrice = sizeVariant?.Price ?? colorVariant?.Price ?? product.Price;
+
+                    return new
+                    {
+                        cartEntryId = e.Id,
+                        product,
+                        quantity = e.Quantity,
+                        colorVariantId = e.ColorVariantId,
+                        sizeVariantId = e.SizeVariantId,
+                        colorVariantLabel = colorVariant?.Color,
+                        sizeVariantLabel = sizeVariant?.Size,
+                        effectiveUnitPrice,
+                    };
+                });
 
             return Ok(result);
         }
@@ -378,6 +470,34 @@ namespace TrendMarketServer.Controllers
             await _db.SaveChangesAsync();
 
             return Ok(new { success = true, newRating = product.Rating });
+        }
+
+        // 14. Stoğa Gelince Haber Ver (bir renk/beden varyantı ya da doğrudan ürün için)
+        [HttpPost("{id}/notify")]
+        [Authorize(Roles = "Customer")]
+        public async Task<IActionResult> RequestStockNotification(int id, [FromQuery] int? variantId = null)
+        {
+            var product = await _db.Products.FindAsync(id);
+            if (product == null) return NotFound(new { success = false, message = "Ürün bulunamadı." });
+
+            var customerId = CurrentCustomerId;
+            var existing = await _db.ProductNotifyRequests.FirstOrDefaultAsync(n =>
+                n.ProductId == id && n.CustomerId == customerId && n.VariantId == variantId);
+
+            if (existing != null)
+            {
+                return Ok(new { success = true, alreadyRequested = true });
+            }
+
+            _db.ProductNotifyRequests.Add(new ProductNotifyRequest
+            {
+                ProductId = id,
+                VariantId = variantId,
+                CustomerId = customerId,
+            });
+            await _db.SaveChangesAsync();
+
+            return Ok(new { success = true, alreadyRequested = false });
         }
 
         // 7. SOHBET: Belirli Bir Ürüne Ait Mesaj Geçmişini Getir

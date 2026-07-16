@@ -11,4 +11,7 @@ public class OrderItem
     public int Quantity { get; set; }
     public decimal UnitPrice { get; set; }
     public int SellerId { get; set; }
+    // Sipariş anında seçilmiş olan renk/beden — sadece görüntüleme amaçlı (bkz. OrdersController.GetMyOrders).
+    public string? ColorVariantLabel { get; set; }
+    public string? SizeVariantLabel { get; set; }
 }
