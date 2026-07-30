@@ -65,6 +65,12 @@ namespace TrendMarketServer.Controllers
                 .Select(g => new { ProductId = g.Key, Quantity = g.Sum(c => c.Quantity) })
                 .ToDictionaryAsync(x => x.ProductId, x => x.Quantity);
 
+            var favoriteProductIds = new HashSet<int>(
+                await _db.FavoriteEntries
+                    .Where(f => f.SessionId == sessionId && productIds.Contains(f.ProductId))
+                    .Select(f => f.ProductId)
+                    .ToListAsync());
+
             var variants = await _db.ProductVariants
                 .Where(v => productIds.Contains(v.ProductId))
                 .ToListAsync();
@@ -80,11 +86,15 @@ namespace TrendMarketServer.Controllers
             return products.Select(p =>
             {
                 decimal? last30DayLowestPrice = null;
+                decimal? oldPrice = null;
                 bool hasPriceDrop = false;
                 if (historyByProduct.TryGetValue(p.Id, out var rows))
                 {
                     last30DayLowestPrice = rows.Min(r => r.Price);
                     hasPriceDrop = rows.Any(r => r.Price > p.Price);
+                    // "Eski fiyat" olarak son 30 gündeki en yüksek kaydı gösteriyoruz — üstü çizili
+                    // fiyat, ürünün yakın zamanda gerçekten bu tutara satıldığını temsil eder.
+                    if (hasPriceDrop) oldPrice = rows.Max(r => r.Price);
                 }
 
                 var productVariants = variantsByProduct.TryGetValue(p.Id, out var v)
@@ -114,10 +124,11 @@ namespace TrendMarketServer.Controllers
                     p.RatingSum,
                     p.RatingCount,
                     p.Rating,
-                    IsFavorite = FavoriteProducts.Contains(p.Id),
+                    IsFavorite = favoriteProductIds.Contains(p.Id),
                     CartQuantity = cartQuantities.TryGetValue(p.Id, out var qty) ? qty : 0,
                     Last30DayLowestPrice = last30DayLowestPrice,
                     HasPriceDrop = hasPriceDrop,
+                    OldPrice = oldPrice,
                     Variants = productVariants,
                     Images = productImages,
                 };
@@ -212,12 +223,13 @@ namespace TrendMarketServer.Controllers
             public string Text { get; set; } = string.Empty;
         }
 
-        // --- BELLEKTE TUTULAN FAVORİ / MESAJ VERİLERİ (sepet artık veritabanında, bkz. CartEntry) ---
-        internal static readonly HashSet<int> FavoriteProducts = new HashSet<int>();
+        // --- BELLEKTE TUTULAN MESAJ VERİLERİ ---
+        // (Favoriler artık cihaz oturumuna göre veritabanında tutuluyor — bkz. FavoriteEntry.)
 
         // Bir ürün silindiğinde favori listesinde hayalet (var olmayan ürüne ait) bir kayıt
         // kalmasın diye SellerProductsController.DeleteProduct tarafından çağrılır.
-        internal static void RemoveFromFavorites(int productId) => FavoriteProducts.Remove(productId);
+        internal static async Task RemoveFromFavoritesAsync(AppDbContext db, int productId) =>
+            await db.FavoriteEntries.Where(f => f.ProductId == productId).ExecuteDeleteAsync();
 
         private static readonly List<MessageItem> GlobalMessages = new List<MessageItem>
         {
@@ -267,10 +279,7 @@ namespace TrendMarketServer.Controllers
         {
             var sessionId = CartSessionId;
             var cartCount = await _db.CartEntries.Where(c => c.SessionId == sessionId).SumAsync(c => c.Quantity);
-            // Silinen ürünlere ait hayalet favori kayıtları rozet sayısını şişirmesin diye
-            // sadece hâlâ var olan ürünlere göre sayıyoruz.
-            var favoriteIds = FavoriteProducts.ToList();
-            var favoriteCount = await _db.Products.CountAsync(p => favoriteIds.Contains(p.Id));
+            var favoriteCount = await _db.FavoriteEntries.CountAsync(f => f.SessionId == sessionId);
             return Ok(new { cartCount, favoriteCount });
         }
 
@@ -434,22 +443,36 @@ namespace TrendMarketServer.Controllers
             return Ok(result);
         }
 
-        // 5. Favorilere Ekleme / Kaldırma
+        // 5. Favorilere Ekleme / Kaldırma (cihaz oturumuna göre — bkz. FavoriteEntry)
         [HttpPost("favorites/{id}")]
-        public IActionResult ToggleFavorite(int id)
+        public async Task<IActionResult> ToggleFavorite(int id)
         {
+            var sessionId = CartSessionId;
+            var existing = await _db.FavoriteEntries.FirstOrDefaultAsync(f => f.SessionId == sessionId && f.ProductId == id);
             bool isFavorite;
-            if (FavoriteProducts.Contains(id))
+            if (existing != null)
             {
-                FavoriteProducts.Remove(id);
+                _db.FavoriteEntries.Remove(existing);
                 isFavorite = false;
             }
             else
             {
-                FavoriteProducts.Add(id);
+                _db.FavoriteEntries.Add(new FavoriteEntry { SessionId = sessionId, ProductId = id });
                 isFavorite = true;
             }
-            return Ok(new { success = true, favoriteCount = FavoriteProducts.Count, isFavorite });
+            await _db.SaveChangesAsync();
+            var favoriteCount = await _db.FavoriteEntries.CountAsync(f => f.SessionId == sessionId);
+            return Ok(new { success = true, favoriteCount, isFavorite });
+        }
+
+        // Müşteri hesap değiştirdiğinde (giriş/çıkış) önceki oturumun favorileri yeni hesaba
+        // sızmasın diye çağrılır — bkz. App.js handleCustomerAuthenticated/handleCustomerLogout.
+        [HttpDelete("favorites")]
+        public async Task<IActionResult> ClearFavorites()
+        {
+            var sessionId = CartSessionId;
+            await _db.FavoriteEntries.Where(f => f.SessionId == sessionId).ExecuteDeleteAsync();
+            return Ok(new { success = true });
         }
 
         // 6. Ürüne Puan Verme (sadece bu ürünü satın alan müşteriler)

@@ -102,6 +102,15 @@ using (var scope = app.Services.CreateScope())
     var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
     DbSeeder.EnsureBaselineMigrationMarked(db);
     db.Database.Migrate();
+
+    // SQLite'ın varsayılan kilitleme modunda, aynı anda gelen farklı istekler (ör. bir sekmede
+    // müşteri ürün görüntülerken diğer sekmede satıcı ürün güncellemesi yaparken) birbirini
+    // kilitleyip "database is locked" hatasına yol açabiliyordu. WAL modu okuma/yazmaların
+    // birbirini bloklamasını büyük ölçüde ortadan kaldırır; busy_timeout ise üst üste binen
+    // yazmalarda anında hata vermek yerine kısa süre bekleyip tekrar dener.
+    db.Database.ExecuteSqlRaw("PRAGMA journal_mode=WAL;");
+    db.Database.ExecuteSqlRaw("PRAGMA busy_timeout=5000;");
+
     DbSeeder.Seed(db);
     DbSeeder.EnsureAdminAccount(db, builder.Configuration["AdminAccount:Email"]!, builder.Configuration["AdminAccount:Password"]!);
     DbSeeder.BackfillProductNameTranslations(db);

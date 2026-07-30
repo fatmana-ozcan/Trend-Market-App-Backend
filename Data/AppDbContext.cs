@@ -24,7 +24,8 @@ public class AppDbContext : DbContext
     public DbSet<ProductImage> ProductImages => Set<ProductImage>();
     public DbSet<ProductNotifyRequest> ProductNotifyRequests => Set<ProductNotifyRequest>();
     public DbSet<Admin> Admins => Set<Admin>();
-
+    public DbSet<FavoriteEntry> FavoriteEntries => Set<FavoriteEntry>();
+public DbSet<SupportTicket> SupportTickets => Set<SupportTicket>();
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
         modelBuilder.Entity<Seller>()
@@ -51,6 +52,10 @@ public class AppDbContext : DbContext
 
         modelBuilder.Entity<Admin>()
             .HasIndex(a => a.Email)
+            .IsUnique();
+
+        modelBuilder.Entity<FavoriteEntry>()
+            .HasIndex(f => new { f.SessionId, f.ProductId })
             .IsUnique();
     }
 }

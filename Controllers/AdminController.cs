@@ -83,7 +83,7 @@ namespace TrendMarketServer.Controllers
             var productIds = await _db.Products.Where(p => p.SellerId == id).Select(p => p.Id).ToListAsync();
             foreach (var productId in productIds)
             {
-                ProductsController.RemoveFromFavorites(productId);
+                await ProductsController.RemoveFromFavoritesAsync(_db, productId);
             }
 
             _db.Products.RemoveRange(_db.Products.Where(p => p.SellerId == id));
@@ -379,7 +379,7 @@ namespace TrendMarketServer.Controllers
 
             _db.Products.Remove(product);
             await _db.SaveChangesAsync();
-            ProductsController.RemoveFromFavorites(id);
+            await ProductsController.RemoveFromFavoritesAsync(_db, id);
             return Ok(new { success = true });
         }
 

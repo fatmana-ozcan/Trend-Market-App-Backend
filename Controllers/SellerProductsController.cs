@@ -144,7 +144,7 @@ namespace TrendMarketServer.Controllers
 
             _db.Products.Remove(product);
             await _db.SaveChangesAsync();
-            ProductsController.RemoveFromFavorites(id);
+            await ProductsController.RemoveFromFavoritesAsync(_db, id);
             return Ok(new { success = true });
         }
 
