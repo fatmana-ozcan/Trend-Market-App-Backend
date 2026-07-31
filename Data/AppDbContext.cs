@@ -36,14 +36,19 @@ public DbSet<SupportTicket> SupportTickets => Set<SupportTicket>();
             .HasIndex(c => c.Email)
             .IsUnique();
 
+        // Sepet/favori/gezinti satırları ya bir hesaba (CustomerId) ya da misafir cihaz
+        // oturumuna (CustomerId = 0 + SessionId) aittir; tekillik bu ikisinin birlikte
+        // oluşturduğu sahiplik anahtarına göre uygulanır. Aksi halde aynı cihazda A hesabının
+        // bıraktığı satır, B hesabının aynı ürünü eklemesini benzersizlik ihlaliyle engellerdi.
         modelBuilder.Entity<ProductView>()
-            .HasIndex(v => new { v.CustomerId, v.ProductId })
+            .HasIndex(v => new { v.CustomerId, v.SessionId, v.ProductId })
             .IsUnique();
 
-        // Aynı ürünün farklı renk/beden varyantları artık ayrı sepet satırları olabildiğinden
-        // (bkz. CartEntry.ColorVariantId/SizeVariantId), tekillik bu üç alanın birlikte kombinasyonuna göre uygulanır.
+        // Aynı ürünün farklı renk/beden varyantları ayrı sepet satırları olabildiğinden
+        // (bkz. CartEntry.ColorVariantId/SizeVariantId), tekillik sahiplik anahtarıyla birlikte
+        // bu alanların tamamının kombinasyonuna göre uygulanır.
         modelBuilder.Entity<CartEntry>()
-            .HasIndex(c => new { c.SessionId, c.ProductId, c.ColorVariantId, c.SizeVariantId })
+            .HasIndex(c => new { c.CustomerId, c.SessionId, c.ProductId, c.ColorVariantId, c.SizeVariantId })
             .IsUnique();
 
         modelBuilder.Entity<ProductNotifyRequest>()
@@ -55,7 +60,7 @@ public DbSet<SupportTicket> SupportTickets => Set<SupportTicket>();
             .IsUnique();
 
         modelBuilder.Entity<FavoriteEntry>()
-            .HasIndex(f => new { f.SessionId, f.ProductId })
+            .HasIndex(f => new { f.CustomerId, f.SessionId, f.ProductId })
             .IsUnique();
     }
 }

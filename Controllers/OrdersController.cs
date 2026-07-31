@@ -54,10 +54,11 @@ namespace TrendMarketServer.Controllers
 
         private int CurrentCustomerId => int.Parse(User.FindFirstValue(ClaimTypes.NameIdentifier)!);
 
-        private string CartSessionId =>
-            Request.Headers.TryGetValue("X-Cart-Session", out var values) && !string.IsNullOrWhiteSpace(values.ToString())
-                ? values.ToString()
-                : "anonymous";
+        // Ödeme uçlarının tamamı giriş gerektirdiğinden sepet her zaman hesaba devredilmiş
+        // satırlardan okunur (CustomerId = müşteri, SessionId = ""); bkz. CartEntry ve
+        // ProductsController.AdoptSessionData.
+        private IQueryable<CartEntry> CurrentCart =>
+            _db.CartEntries.Where(c => c.CustomerId == CurrentCustomerId && c.SessionId == "");
 
         private async Task<decimal> GetCouponBalanceAsync(int customerId)
         {
@@ -74,8 +75,7 @@ namespace TrendMarketServer.Controllers
         [HttpPost("checkout/request-code")]
         public async Task<IActionResult> RequestCheckoutCode([FromBody] CheckoutDto dto)
         {
-            var sessionId = CartSessionId;
-            var cartEntries = await _db.CartEntries.Where(c => c.SessionId == sessionId).ToListAsync();
+            var cartEntries = await CurrentCart.ToListAsync();
             if (cartEntries.Count == 0)
                 return BadRequest(new { success = false, message = "Sepetiniz boş." });
 
@@ -128,8 +128,7 @@ namespace TrendMarketServer.Controllers
 
             var dto = (CheckoutDto)entry.Payload!;
 
-            var sessionId = CartSessionId;
-            var cartEntries = await _db.CartEntries.Where(c => c.SessionId == sessionId).ToListAsync();
+            var cartEntries = await CurrentCart.ToListAsync();
             if (cartEntries.Count == 0)
                 return BadRequest(new { success = false, message = "Sepetiniz boş." });
 

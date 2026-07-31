@@ -29,12 +29,23 @@ namespace TrendMarketServer.Controllers
 
         private int CurrentCustomerId => int.Parse(User.FindFirstValue(ClaimTypes.NameIdentifier)!);
 
-        // Sepet, giriş yapmadan da kullanılabildiği için müşteri kimliğine değil, cihazda
-        // kalıcı üretilip her istekte gönderilen bu anonim oturum kimliğine göre ayrılır.
+        // Cihazda kalıcı üretilip her istekte gönderilen anonim oturum kimliği; misafir
+        // sepetini/favorilerini ayırt etmek için kullanılır.
         private string CartSessionId =>
             Request.Headers.TryGetValue("X-Cart-Session", out var values) && !string.IsNullOrWhiteSpace(values.ToString())
                 ? values.ToString()
                 : "anonymous";
+
+        // Sepet/favori/gezinti uçları giriş zorunlu değildir ama token gönderildiyse kimlik yine
+        // de çözülür. Giriş yapılmışsa satırlar hesaba, yapılmamışsa misafir cihaz oturumuna
+        // aittir. Bu ikili (OwnerCustomerId, OwnerSessionId) tüm sorgularda birlikte kullanılır;
+        // hesaba devredilen satırlarda SessionId "" olduğundan sepet cihazdan bağımsız hale gelir.
+        private int OwnerCustomerId =>
+            User.Identity?.IsAuthenticated == true && User.IsInRole("Customer")
+                ? int.Parse(User.FindFirstValue(ClaimTypes.NameIdentifier)!)
+                : 0;
+
+        private string OwnerSessionId => OwnerCustomerId == 0 ? CartSessionId : string.Empty;
 
         private async Task<bool> HasPurchasedAsync(int customerId, int productId)
         {
@@ -55,21 +66,23 @@ namespace TrendMarketServer.Controllers
                 .ToListAsync();
             var historyByProduct = recentHistory.GroupBy(h => h.ProductId).ToDictionary(g => g.Key, g => g.ToList());
 
-            var sessionId = CartSessionId;
+            var ownerId = OwnerCustomerId;
+            var ownerSession = OwnerSessionId;
             // Bir ürünün birden fazla varyant kombinasyonuyla (farklı renk/beden) ayrı sepet
             // satırları olabileceğinden, ürün başına adet toplamı GroupBy ile alınır — aksi halde
             // ToDictionaryAsync tekrarlı ProductId anahtarında hata fırlatırdı.
             var cartQuantities = await _db.CartEntries
-                .Where(c => c.SessionId == sessionId && productIds.Contains(c.ProductId))
+                .Where(c => c.CustomerId == ownerId && c.SessionId == ownerSession && productIds.Contains(c.ProductId))
                 .GroupBy(c => c.ProductId)
                 .Select(g => new { ProductId = g.Key, Quantity = g.Sum(c => c.Quantity) })
                 .ToDictionaryAsync(x => x.ProductId, x => x.Quantity);
 
-            var favoriteProductIds = new HashSet<int>(
-                await _db.FavoriteEntries
-                    .Where(f => f.SessionId == sessionId && productIds.Contains(f.ProductId))
-                    .Select(f => f.ProductId)
-                    .ToListAsync());
+            // FavoriteEntry.Id, favorilere eklendiği sırayı yansıtır (bkz. GetCartDetails'teki
+            // aynı mantık) — Favoriler ekranında en son favorilenen en üstte gösterilebilsin diye
+            // sadece var/yok bilgisi değil, sıralama için kullanılabilecek bu değer de dönülür.
+            var favoriteEntryIdByProduct = await _db.FavoriteEntries
+                .Where(f => f.CustomerId == ownerId && f.SessionId == ownerSession && productIds.Contains(f.ProductId))
+                .ToDictionaryAsync(f => f.ProductId, f => f.Id);
 
             var variants = await _db.ProductVariants
                 .Where(v => productIds.Contains(v.ProductId))
@@ -124,7 +137,8 @@ namespace TrendMarketServer.Controllers
                     p.RatingSum,
                     p.RatingCount,
                     p.Rating,
-                    IsFavorite = favoriteProductIds.Contains(p.Id),
+                    IsFavorite = favoriteEntryIdByProduct.ContainsKey(p.Id),
+                    FavoriteOrder = favoriteEntryIdByProduct.TryGetValue(p.Id, out var favId) ? favId : (int?)null,
                     CartQuantity = cartQuantities.TryGetValue(p.Id, out var qty) ? qty : 0,
                     Last30DayLowestPrice = last30DayLowestPrice,
                     HasPriceDrop = hasPriceDrop,
@@ -251,7 +265,10 @@ namespace TrendMarketServer.Controllers
 
             if (!string.IsNullOrEmpty(search))
             {
-                query = query.Where(p => p.Name.Contains(search));
+                // SQLite'ta string.Contains() (instr()'e çevrilir) büyük/küçük harf duyarlıdır,
+                // bu yüzden "powerbank" araması "Powerbank" ürününü bulamıyordu. EF.Functions.Like
+                // ise SQLite'ın varsayılan LIKE davranışını kullanır (ASCII harflerde harf duyarsız).
+                query = query.Where(p => EF.Functions.Like(p.Name, $"%{search}%"));
             }
 
             var products = await query.ToListAsync();
@@ -277,19 +294,24 @@ namespace TrendMarketServer.Controllers
         [HttpGet("counts")]
         public async Task<IActionResult> GetCounts()
         {
-            var sessionId = CartSessionId;
-            var cartCount = await _db.CartEntries.Where(c => c.SessionId == sessionId).SumAsync(c => c.Quantity);
-            var favoriteCount = await _db.FavoriteEntries.CountAsync(f => f.SessionId == sessionId);
+            var ownerId = OwnerCustomerId;
+            var ownerSession = OwnerSessionId;
+            var cartCount = await _db.CartEntries
+                .Where(c => c.CustomerId == ownerId && c.SessionId == ownerSession)
+                .SumAsync(c => c.Quantity);
+            var favoriteCount = await _db.FavoriteEntries
+                .CountAsync(f => f.CustomerId == ownerId && f.SessionId == ownerSession);
             return Ok(new { cartCount, favoriteCount });
         }
 
-        // 12. Önceden Gezdiğim Ürünler
+        // 12. Önceden Gezdiğim Ürünler (misafirken de tutulur; girişte hesaba devredilir)
         [HttpGet("recently-viewed")]
-        [Authorize(Roles = "Customer")]
         public async Task<IActionResult> GetRecentlyViewed()
         {
+            var ownerId = OwnerCustomerId;
+            var ownerSession = OwnerSessionId;
             var viewedProductIds = await _db.ProductViews
-                .Where(v => v.CustomerId == CurrentCustomerId)
+                .Where(v => v.CustomerId == ownerId && v.SessionId == ownerSession)
                 .OrderByDescending(v => v.ViewedAt)
                 .Select(v => v.ProductId)
                 .Take(10)
@@ -308,14 +330,15 @@ namespace TrendMarketServer.Controllers
 
         // 13. Ürün Görüntülemesini Kaydet (gezinti geçmişi için)
         [HttpPost("{id}/view")]
-        [Authorize(Roles = "Customer")]
         public async Task<IActionResult> RecordView(int id)
         {
             var productExists = await _db.Products.AnyAsync(p => p.Id == id);
             if (!productExists) return NotFound(new { success = false, message = "Ürün bulunamadı." });
 
+            var ownerId = OwnerCustomerId;
+            var ownerSession = OwnerSessionId;
             var existing = await _db.ProductViews
-                .FirstOrDefaultAsync(v => v.CustomerId == CurrentCustomerId && v.ProductId == id);
+                .FirstOrDefaultAsync(v => v.CustomerId == ownerId && v.SessionId == ownerSession && v.ProductId == id);
 
             if (existing != null)
             {
@@ -323,7 +346,7 @@ namespace TrendMarketServer.Controllers
             }
             else
             {
-                _db.ProductViews.Add(new ProductView { CustomerId = CurrentCustomerId, ProductId = id });
+                _db.ProductViews.Add(new ProductView { CustomerId = ownerId, SessionId = ownerSession, ProductId = id });
             }
 
             await _db.SaveChangesAsync();
@@ -342,9 +365,10 @@ namespace TrendMarketServer.Controllers
             if (sizeVariantId.HasValue && !await _db.ProductVariants.AnyAsync(v => v.Id == sizeVariantId.Value && v.ProductId == id))
                 return BadRequest(new { success = false, message = "Geçersiz beden seçeneği." });
 
-            var sessionId = CartSessionId;
+            var ownerId = OwnerCustomerId;
+            var ownerSession = OwnerSessionId;
             var entry = await _db.CartEntries.FirstOrDefaultAsync(c =>
-                c.SessionId == sessionId && c.ProductId == id &&
+                c.CustomerId == ownerId && c.SessionId == ownerSession && c.ProductId == id &&
                 c.ColorVariantId == colorVariantId && c.SizeVariantId == sizeVariantId);
             if (entry != null)
             {
@@ -354,7 +378,8 @@ namespace TrendMarketServer.Controllers
             {
                 _db.CartEntries.Add(new CartEntry
                 {
-                    SessionId = sessionId,
+                    CustomerId = ownerId,
+                    SessionId = ownerSession,
                     ProductId = id,
                     Quantity = 1,
                     ColorVariantId = colorVariantId,
@@ -363,7 +388,9 @@ namespace TrendMarketServer.Controllers
             }
             await _db.SaveChangesAsync();
 
-            int totalItemsCount = await _db.CartEntries.Where(c => c.SessionId == sessionId).SumAsync(c => c.Quantity);
+            int totalItemsCount = await _db.CartEntries
+                .Where(c => c.CustomerId == ownerId && c.SessionId == ownerSession)
+                .SumAsync(c => c.Quantity);
             return Ok(new { success = true, currentCartCount = totalItemsCount });
         }
 
@@ -371,9 +398,10 @@ namespace TrendMarketServer.Controllers
         [HttpDelete("cart/{id}")]
         public async Task<IActionResult> RemoveFromCart(int id, [FromQuery] int? colorVariantId = null, [FromQuery] int? sizeVariantId = null)
         {
-            var sessionId = CartSessionId;
+            var ownerId = OwnerCustomerId;
+            var ownerSession = OwnerSessionId;
             var entry = await _db.CartEntries.FirstOrDefaultAsync(c =>
-                c.SessionId == sessionId && c.ProductId == id &&
+                c.CustomerId == ownerId && c.SessionId == ownerSession && c.ProductId == id &&
                 c.ColorVariantId == colorVariantId && c.SizeVariantId == sizeVariantId);
             if (entry == null)
                 return BadRequest(new { success = false, message = "Ürün sepette yok" });
@@ -385,17 +413,20 @@ namespace TrendMarketServer.Controllers
             }
             await _db.SaveChangesAsync();
 
-            int totalItemsCount = await _db.CartEntries.Where(c => c.SessionId == sessionId).SumAsync(c => c.Quantity);
+            int totalItemsCount = await _db.CartEntries
+                .Where(c => c.CustomerId == ownerId && c.SessionId == ownerSession)
+                .SumAsync(c => c.Quantity);
             return Ok(new { success = true, currentCartCount = totalItemsCount });
         }
 
-        // 3b. Sepeti tamamen boşaltma — müşteri giriş/kayıt yaptığında, giriş öncesi anonim
-        // oturuma ait sepetin hesaba taşınmaması için çağrılır (bkz. CustomerAuthScreen).
+        // 3b. Sepeti tamamen boşaltma (kullanıcının kendi isteğiyle). Giriş/çıkışta artık
+        // çağrılmaz — hesap değişiminde satırlar silinmek yerine devredilir, bkz. AdoptSessionData.
         [HttpDelete("cart")]
         public async Task<IActionResult> ClearCart()
         {
-            var sessionId = CartSessionId;
-            var entries = _db.CartEntries.Where(c => c.SessionId == sessionId);
+            var ownerId = OwnerCustomerId;
+            var ownerSession = OwnerSessionId;
+            var entries = _db.CartEntries.Where(c => c.CustomerId == ownerId && c.SessionId == ownerSession);
             _db.CartEntries.RemoveRange(entries);
             await _db.SaveChangesAsync();
             return Ok(new { success = true });
@@ -406,8 +437,15 @@ namespace TrendMarketServer.Controllers
         [HttpGet("cart-details")]
         public async Task<IActionResult> GetCartDetails()
         {
-            var sessionId = CartSessionId;
-            var entries = await _db.CartEntries.Where(c => c.SessionId == sessionId).ToListAsync();
+            var ownerId = OwnerCustomerId;
+            var ownerSession = OwnerSessionId;
+            // En son eklenen ürün en üstte görünsün diye Id'ye göre azalan sırada (Id, satır
+            // ilk eklendiğinde otomatik artan bir değer olduğundan ekleme sırasını yansıtır;
+            // zaten sepette olan bir üründe miktar artırmak yeni satır oluşturmadığı için sırasını değiştirmez).
+            var entries = await _db.CartEntries
+                .Where(c => c.CustomerId == ownerId && c.SessionId == ownerSession)
+                .OrderByDescending(c => c.Id)
+                .ToListAsync();
             var productIds = entries.Select(e => e.ProductId).ToList();
             var products = await _db.Products.Where(p => productIds.Contains(p.Id)).ToDictionaryAsync(p => p.Id);
 
@@ -443,12 +481,14 @@ namespace TrendMarketServer.Controllers
             return Ok(result);
         }
 
-        // 5. Favorilere Ekleme / Kaldırma (cihaz oturumuna göre — bkz. FavoriteEntry)
+        // 5. Favorilere Ekleme / Kaldırma (giriş yapılmışsa hesaba, değilse cihaz oturumuna)
         [HttpPost("favorites/{id}")]
         public async Task<IActionResult> ToggleFavorite(int id)
         {
-            var sessionId = CartSessionId;
-            var existing = await _db.FavoriteEntries.FirstOrDefaultAsync(f => f.SessionId == sessionId && f.ProductId == id);
+            var ownerId = OwnerCustomerId;
+            var ownerSession = OwnerSessionId;
+            var existing = await _db.FavoriteEntries.FirstOrDefaultAsync(f =>
+                f.CustomerId == ownerId && f.SessionId == ownerSession && f.ProductId == id);
             bool isFavorite;
             if (existing != null)
             {
@@ -457,22 +497,128 @@ namespace TrendMarketServer.Controllers
             }
             else
             {
-                _db.FavoriteEntries.Add(new FavoriteEntry { SessionId = sessionId, ProductId = id });
+                _db.FavoriteEntries.Add(new FavoriteEntry { CustomerId = ownerId, SessionId = ownerSession, ProductId = id });
                 isFavorite = true;
             }
             await _db.SaveChangesAsync();
-            var favoriteCount = await _db.FavoriteEntries.CountAsync(f => f.SessionId == sessionId);
+            var favoriteCount = await _db.FavoriteEntries
+                .CountAsync(f => f.CustomerId == ownerId && f.SessionId == ownerSession);
             return Ok(new { success = true, favoriteCount, isFavorite });
         }
 
-        // Müşteri hesap değiştirdiğinde (giriş/çıkış) önceki oturumun favorileri yeni hesaba
-        // sızmasın diye çağrılır — bkz. App.js handleCustomerAuthenticated/handleCustomerLogout.
+        // Favorileri tamamen temizleme (kullanıcının kendi isteğiyle). Giriş/çıkışta artık
+        // çağrılmaz — bkz. AdoptSessionData.
         [HttpDelete("favorites")]
         public async Task<IActionResult> ClearFavorites()
         {
-            var sessionId = CartSessionId;
-            await _db.FavoriteEntries.Where(f => f.SessionId == sessionId).ExecuteDeleteAsync();
+            var ownerId = OwnerCustomerId;
+            var ownerSession = OwnerSessionId;
+            await _db.FavoriteEntries
+                .Where(f => f.CustomerId == ownerId && f.SessionId == ownerSession)
+                .ExecuteDeleteAsync();
             return Ok(new { success = true });
+        }
+
+        // 5c. Misafirken eklenen sepet/favori/gezinti kayıtlarını giriş yapan hesaba devreder.
+        // Önceden bu noktada hepsi siliniyordu (ClearCart + ClearFavorites), bu yüzden çıkış
+        // yapıp tekrar giren kullanıcı sepetini ve favorilerini kaybediyordu. Devirden sonra
+        // misafir oturumu boş kalır, dolayısıyla aynı cihazda başka bir hesaba girildiğinde
+        // önceki hesabın verisi sızmaz. Bkz. App.js handleCustomerAuthenticated.
+        [HttpPost("session/adopt")]
+        [Authorize(Roles = "Customer")]
+        public async Task<IActionResult> AdoptSessionData()
+        {
+            var customerId = CurrentCustomerId;
+            var sessionId = CartSessionId;
+
+            var guestCart = await _db.CartEntries
+                .Where(c => c.CustomerId == 0 && c.SessionId == sessionId)
+                .ToListAsync();
+            if (guestCart.Count > 0)
+            {
+                var accountCart = await _db.CartEntries
+                    .Where(c => c.CustomerId == customerId && c.SessionId == "")
+                    .ToListAsync();
+                foreach (var guestEntry in guestCart)
+                {
+                    // Aynı ürün + aynı varyant kombinasyonu hesapta zaten varsa adetler toplanır,
+                    // yoksa misafir satırı olduğu gibi hesaba geçirilir.
+                    var existing = accountCart.FirstOrDefault(c =>
+                        c.ProductId == guestEntry.ProductId &&
+                        c.ColorVariantId == guestEntry.ColorVariantId &&
+                        c.SizeVariantId == guestEntry.SizeVariantId);
+                    if (existing != null)
+                    {
+                        existing.Quantity += guestEntry.Quantity;
+                        _db.CartEntries.Remove(guestEntry);
+                    }
+                    else
+                    {
+                        guestEntry.CustomerId = customerId;
+                        guestEntry.SessionId = string.Empty;
+                        accountCart.Add(guestEntry);
+                    }
+                }
+            }
+
+            var guestFavorites = await _db.FavoriteEntries
+                .Where(f => f.CustomerId == 0 && f.SessionId == sessionId)
+                .ToListAsync();
+            if (guestFavorites.Count > 0)
+            {
+                var accountFavoriteProductIds = await _db.FavoriteEntries
+                    .Where(f => f.CustomerId == customerId && f.SessionId == "")
+                    .Select(f => f.ProductId)
+                    .ToListAsync();
+                foreach (var guestFavorite in guestFavorites)
+                {
+                    if (accountFavoriteProductIds.Contains(guestFavorite.ProductId))
+                    {
+                        _db.FavoriteEntries.Remove(guestFavorite);
+                    }
+                    else
+                    {
+                        guestFavorite.CustomerId = customerId;
+                        guestFavorite.SessionId = string.Empty;
+                        accountFavoriteProductIds.Add(guestFavorite.ProductId);
+                    }
+                }
+            }
+
+            var guestViews = await _db.ProductViews
+                .Where(v => v.CustomerId == 0 && v.SessionId == sessionId)
+                .ToListAsync();
+            if (guestViews.Count > 0)
+            {
+                var accountViews = await _db.ProductViews
+                    .Where(v => v.CustomerId == customerId && v.SessionId == "")
+                    .ToListAsync();
+                foreach (var guestView in guestViews)
+                {
+                    var existing = accountViews.FirstOrDefault(v => v.ProductId == guestView.ProductId);
+                    if (existing != null)
+                    {
+                        // Ürün her iki tarafta da gezilmişse en son ziyaret zamanı korunur.
+                        if (guestView.ViewedAt > existing.ViewedAt) existing.ViewedAt = guestView.ViewedAt;
+                        _db.ProductViews.Remove(guestView);
+                    }
+                    else
+                    {
+                        guestView.CustomerId = customerId;
+                        guestView.SessionId = string.Empty;
+                        accountViews.Add(guestView);
+                    }
+                }
+            }
+
+            await _db.SaveChangesAsync();
+
+            var cartCount = await _db.CartEntries
+                .Where(c => c.CustomerId == customerId && c.SessionId == "")
+                .SumAsync(c => c.Quantity);
+            var favoriteCount = await _db.FavoriteEntries
+                .CountAsync(f => f.CustomerId == customerId && f.SessionId == "");
+            return Ok(new { success = true, cartCount, favoriteCount });
         }
 
         // 6. Ürüne Puan Verme (sadece bu ürünü satın alan müşteriler)

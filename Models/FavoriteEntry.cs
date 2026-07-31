@@ -6,6 +6,9 @@ namespace TrendMarketServer.Models;
 public class FavoriteEntry
 {
     public int Id { get; set; }
+    // Sahiplik CartEntry ile aynı kuralı izler: misafirde CustomerId = 0 + cihazın SessionId'si,
+    // giriş yapıldığında satır hesaba devredilir (CustomerId = müşteri, SessionId = "").
+    public int CustomerId { get; set; }
     public string SessionId { get; set; } = string.Empty;
     public int ProductId { get; set; }
 }
