@@ -35,6 +35,45 @@ namespace TrendMarketServer.Controllers
             return Ok(new { name = customer.Name, email = customer.Email, phone = customer.Phone });
         }
 
+        public class UpdateProfileDto
+        {
+            public string Name { get; set; } = string.Empty;
+            public string Email { get; set; } = string.Empty;
+            public string Phone { get; set; } = string.Empty;
+        }
+
+        // Profil ekranından ad/e-posta/telefon güncellemesi. Şifre değişmediği için mevcut
+        // oturum (token) geçerliliğini korur — ChangePassword'daki SessionVersion artışına
+        // burada gerek yok.
+        [HttpPut("profile")]
+        [Authorize(Roles = "Customer")]
+        public async Task<IActionResult> UpdateProfile([FromBody] UpdateProfileDto dto)
+        {
+            if (string.IsNullOrWhiteSpace(dto.Name) || string.IsNullOrWhiteSpace(dto.Email) || string.IsNullOrWhiteSpace(dto.Phone))
+                return BadRequest(new { success = false, message = "Ad, e-posta ve telefon zorunludur." });
+
+            var customer = await _db.Customers.FindAsync(CurrentCustomerId);
+            if (customer == null) return NotFound();
+
+            var normalizedEmail = dto.Email.Trim().ToLowerInvariant();
+            var phone = dto.Phone.Trim();
+
+            var emailTaken = await _db.Customers.AnyAsync(c => c.Id != customer.Id && c.Email == normalizedEmail);
+            if (emailTaken)
+                return BadRequest(new { success = false, message = "Bu e-posta başka bir hesap tarafından kullanılıyor." });
+
+            var phoneTaken = await _db.Customers.AnyAsync(c => c.Id != customer.Id && c.Phone == phone);
+            if (phoneTaken)
+                return BadRequest(new { success = false, message = "Bu telefon numarası başka bir hesap tarafından kullanılıyor." });
+
+            customer.Name = dto.Name.Trim();
+            customer.Email = normalizedEmail;
+            customer.Phone = phone;
+            await _db.SaveChangesAsync();
+
+            return Ok(new { success = true, name = customer.Name, email = customer.Email, phone = customer.Phone });
+        }
+
         public class RegisterDto
         {
             public string Name { get; set; } = string.Empty;
@@ -61,6 +100,12 @@ namespace TrendMarketServer.Controllers
             public string NewPassword { get; set; } = string.Empty;
         }
 
+        public class ChangePasswordDto
+        {
+            public string CurrentPassword { get; set; } = string.Empty;
+            public string NewPassword { get; set; } = string.Empty;
+        }
+
         [HttpPost("register")]
         public async Task<IActionResult> Register([FromBody] RegisterDto dto)
         {
@@ -71,15 +116,20 @@ namespace TrendMarketServer.Controllers
                 return BadRequest(new { success = false, message = "Şifre en az 6 karakter olmalıdır." });
 
             var normalizedEmail = dto.Email.Trim().ToLowerInvariant();
-            var exists = await _db.Customers.AnyAsync(c => c.Email == normalizedEmail);
-            if (exists)
+            var emailExists = await _db.Customers.AnyAsync(c => c.Email == normalizedEmail);
+            if (emailExists)
                 return BadRequest(new { success = false, message = "Bu e-posta ile kayıtlı bir hesap zaten var." });
+
+            var phone = dto.Phone.Trim();
+            var phoneExists = await _db.Customers.AnyAsync(c => c.Phone == phone);
+            if (phoneExists)
+                return BadRequest(new { success = false, message = "Bu telefon numarasıyla kayıtlı bir hesap zaten var." });
 
             var customer = new Customer
             {
                 Name = dto.Name.Trim(),
                 Email = normalizedEmail,
-                Phone = dto.Phone.Trim(),
+                Phone = phone,
                 PasswordHash = BCrypt.Net.BCrypt.HashPassword(dto.Password),
             };
 
@@ -106,7 +156,10 @@ namespace TrendMarketServer.Controllers
         public async Task<IActionResult> ForgotPassword([FromBody] ForgotPasswordDto dto)
         {
             var phone = dto.Phone.Trim();
-            var customer = await _db.Customers.FirstOrDefaultAsync(c => c.Phone == phone);
+            // Telefon alanı eskiden tekil değildi (bkz. Register'daki phoneExists kontrolü), bu
+            // yüzden aynı numarayla birden fazla hesap olabilir. Böyle bir çakışmada en son
+            // oluşturulan (muhtemelen hâlâ kullanılan) hesabı hedefliyoruz.
+            var customer = await _db.Customers.Where(c => c.Phone == phone).OrderByDescending(c => c.CreatedAt).FirstOrDefaultAsync();
             if (customer == null)
                 return BadRequest(new { success = false, message = "Bu telefon numarasıyla kayıtlı bir hesap bulunamadı." });
 
@@ -140,13 +193,45 @@ namespace TrendMarketServer.Controllers
             if (!VerificationStore.Entries.TryGetValue(key, out var entry) || entry.ExpiresAt < DateTime.UtcNow || entry.Code != dto.Code.Trim())
                 return BadRequest(new { success = false, message = "Doğrulama kodu geçersiz veya süresi dolmuş." });
 
-            var customer = await _db.Customers.FirstOrDefaultAsync(c => c.Phone == phone);
+            // ForgotPassword'daki aynı çakışma senaryosu için: kodu üreten sorguyla tutarlı olacak
+            // şekilde burada da en son oluşturulan hesap hedeflenir.
+            var customer = await _db.Customers.Where(c => c.Phone == phone).OrderByDescending(c => c.CreatedAt).FirstOrDefaultAsync();
             if (customer == null)
                 return BadRequest(new { success = false, message = "Hesap bulunamadı." });
 
             customer.PasswordHash = BCrypt.Net.BCrypt.HashPassword(dto.NewPassword);
+            // Şifre değiştiğinde, o hesaba ait önceden üretilmiş tüm JWT'ler (ör. başka bir
+            // cihazda/sekmede açık kalmış oturumlar) SessionVersion artırılarak geçersiz kılınır
+            // (bkz. Program.cs OnTokenValidated) — yeni şifreyle tekrar giriş yapılması gerekir.
+            customer.SessionVersion += 1;
             await _db.SaveChangesAsync();
             VerificationStore.Entries.Remove(key);
+
+            return Ok(new { success = true, message = "Şifreniz güncellendi." });
+        }
+
+        // Profil ekranından, oturum açıkken mevcut şifreyi bilerek yapılan değişiklik
+        // (telefon/kod gerektiren ForgotPassword akışından farklı olarak buradaki eşleştirme
+        // token'daki kimlikle yapıldığı için tekil olmayan telefon numarası sorunu oluşmaz).
+        [HttpPost("change-password")]
+        [Authorize(Roles = "Customer")]
+        public async Task<IActionResult> ChangePassword([FromBody] ChangePasswordDto dto)
+        {
+            if (dto.NewPassword.Length < 6)
+                return BadRequest(new { success = false, message = "Yeni şifre en az 6 karakter olmalıdır." });
+
+            var customer = await _db.Customers.FindAsync(CurrentCustomerId);
+            if (customer == null) return NotFound();
+
+            if (!BCrypt.Net.BCrypt.Verify(dto.CurrentPassword, customer.PasswordHash))
+                return BadRequest(new { success = false, message = "Mevcut şifreniz hatalı." });
+
+            customer.PasswordHash = BCrypt.Net.BCrypt.HashPassword(dto.NewPassword);
+            // Bu isteği yapan token da dahil, hesaba ait tüm eski oturumlar geçersiz kılınır —
+            // kullanıcı yeni şifresiyle tekrar giriş yapmak zorunda kalır (bkz. ResetPassword'daki
+            // aynı gerekçe).
+            customer.SessionVersion += 1;
+            await _db.SaveChangesAsync();
 
             return Ok(new { success = true, message = "Şifreniz güncellendi." });
         }
